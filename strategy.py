@@ -103,7 +103,8 @@ class MyTradingStrategy(AbstractTradingStrategy):
 
         # Expected final sum
         sum_revealed = float(np.sum(current_rolls)) if num_revealed > 0 else 0.0
-        expected_final_sum = sum_revealed + per_roll_mean * num_remaining
+        # expected_final_sum = sum_revealed + per_roll_mean * num_remaining
+        expected_final_sum = per_roll_mean * num_remaining
 
         # Remaining uncertainty (standard deviation of final sum)
         std_remaining = per_roll_std * math.sqrt(max(1, num_remaining))
