@@ -18,27 +18,34 @@ class MyTradingStrategy(AbstractTradingStrategy):
     # ============ CONFIGURATION ============
 
     # Futures settings
-    FUT_BASE_SPREAD = 0.10      # 10% of remaining std
-    FUT_MIN_SPREAD = 5.0        # Minimum spread on futures
+    TRADE_FUTURES = True         # Enable/disable futures trading
+    FUT_BASE_SPREAD = 0.02       # 2% of remaining std (very tight)
+    FUT_MIN_SPREAD = 1.0         # Minimum spread on futures
 
     # Options settings
-    OPT_BASE_SPREAD = 0.15      # 15% of option fair value
-    OPT_MIN_SPREAD = 2.0        # Minimum spread on options
-    OPT_VOL_ADJUST = True       # Adjust spreads based on realized volatility
-    OPT_TAIL_ADJUST = True      # Adjust spreads for fat-tailed distributions
+    OPT_BASE_SPREAD = 0.03      # 3% of option fair value (ULTRA tight)
+    OPT_MIN_SPREAD = 0.3        # Minimum spread on options (tiny)
+    OPT_VOL_ADJUST = False      # Disable vol adjustments (keep spreads consistent)
+    OPT_TAIL_ADJUST = False     # Disable tail adjustments (keep spreads consistent)
+    OPT_MIN_FAIR_VALUE = 0.01   # Quote almost anything (near-zero filter)
 
     # Strike selection
-    NUM_STRIKES_PER_SIDE = 3    # Quote 3 calls and 3 puts near ATM
+    QUOTE_ALL_STRIKES = True    # Quote ALL available strikes (maximum coverage)
+    NUM_STRIKES_PER_SIDE = 999  # Effectively unlimited (ignored if QUOTE_ALL_STRIKES=True)
 
-    # Inventory management
-    INV_SKEW_FACTOR = 0.01      # Shift mid by 1% per unit of inventory
-    INV_WIDEN_FACTOR = 0.05     # Widen spread by 5% per unit beyond limit
-    INV_SOFT_LIMIT = 5          # Start widening spreads beyond this
-    INV_HARD_LIMIT = 10         # Stop quoting beyond this
+    # Inventory management - VERY RELAXED for maximum volume
+    INV_SKEW_FACTOR = 0.005     # Shift mid by 0.5% per unit (minimal skew)
+    INV_WIDEN_FACTOR = 0.02     # Widen spread by 2% per unit (minimal widening)
+    INV_SOFT_LIMIT = 20         # Start widening at 20 contracts (very high)
+    INV_HARD_LIMIT = 50         # Stop quoting at 50 contracts (extremely high)
 
     # Risk controls
-    MIN_BID = 0.1               # Engine requires positive bids
-    MAX_SPREAD_RATIO = 5.0      # Don't quote if spread > 5x fair value
+    MIN_BID = 0.01              # Minimum possible bid (quote cheap options)
+    MAX_SPREAD_RATIO = 50.0     # Extremely permissive (quote everything)
+
+    # Aggressive quoting
+    CROSS_SPREAD = True         # Allow bid > "fair" and ask < "fair" for more matches
+    CROSS_SPREAD_FACTOR = 0.02  # Cross by 2% of fair value
 
     def __init__(self):
         self.team_name = "Unknown"
@@ -103,17 +110,24 @@ class MyTradingStrategy(AbstractTradingStrategy):
 
         # Expected final sum
         sum_revealed = float(np.sum(current_rolls)) if num_revealed > 0 else 0.0
-        # expected_final_sum = sum_revealed + per_roll_mean * num_remaining
+        #expected_final_sum = sum_revealed + per_roll_mean * num_remaining
         expected_final_sum = per_roll_mean * num_remaining
 
         # Remaining uncertainty (standard deviation of final sum)
         std_remaining = per_roll_std * math.sqrt(max(1, num_remaining))
 
         # Adjust for distribution characteristics
-        if len(all_rolls) > 0:
-            std_remaining_adjusted = std_remaining * vol_multiplier
-        else:
-            std_remaining_adjusted = std_remaining
+        # DISABLED for maximum volume - just use raw std
+        std_remaining_adjusted = std_remaining
+        # if len(all_rolls) > 0:
+        #     std_remaining_adjusted = std_remaining * vol_multiplier
+        # else:
+        #     std_remaining_adjusted = std_remaining
+
+        # Special handling for very late subrounds (low remaining dice)
+        # When there are few dice left, still quote but be careful
+        if num_remaining < 50:  # Almost no dice left
+            return {}  # Stop quoting when values near zero
 
         # Get all products and categorize them
         products = marketplace.get_products()
@@ -129,33 +143,41 @@ class MyTradingStrategy(AbstractTradingStrategy):
             if product_type == "F":
                 futures.append(product)
             elif product_type == "C":
-                strike = float(parts[2])
+                # Format: S,C,expiry,strike
+                strike = float(parts[3])
                 calls.append((strike, product))
             elif product_type == "P":
-                strike = float(parts[2])
+                # Format: S,P,expiry,strike
+                strike = float(parts[3])
                 puts.append((strike, product))
 
-        # Select near-ATM strikes
-        calls.sort(key=lambda x: abs(x[0] - expected_final_sum))
-        puts.sort(key=lambda x: abs(x[0] - expected_final_sum))
-
-        selected_calls = calls[:self.NUM_STRIKES_PER_SIDE]
-        selected_puts = puts[:self.NUM_STRIKES_PER_SIDE]
+        # Select strikes to quote
+        if self.QUOTE_ALL_STRIKES:
+            # Quote ALL strikes available
+            selected_calls = calls
+            selected_puts = puts
+        else:
+            # Quote only near-ATM strikes
+            calls.sort(key=lambda x: abs(x[0] - expected_final_sum))
+            puts.sort(key=lambda x: abs(x[0] - expected_final_sum))
+            selected_calls = calls[:self.NUM_STRIKES_PER_SIDE]
+            selected_puts = puts[:self.NUM_STRIKES_PER_SIDE]
 
         # Build quotes
         quotes = {}
 
         # Quote futures (use unadjusted std for futures)
-        for product in futures:
-            quote = self._quote_future(
-                product=product,
-                fair_value=expected_final_sum,
-                std_remaining=std_remaining,
-                my_trades=my_trades
-            )
-            if quote:
-                pid = getattr(product, "product_id", None) or getattr(product, "id", None)
-                quotes[pid] = quote
+        if self.TRADE_FUTURES:
+            for product in futures:
+                quote = self._quote_future(
+                    product=product,
+                    fair_value=expected_final_sum,
+                    std_remaining=std_remaining,
+                    my_trades=my_trades
+                )
+                if quote:
+                    pid = getattr(product, "product_id", None) or getattr(product, "id", None)
+                    quotes[pid] = quote
 
         # Quote options (use adjusted std for options to account for vol characteristics)
         for strike, product in selected_calls + selected_puts:
@@ -243,6 +265,10 @@ class MyTradingStrategy(AbstractTradingStrategy):
             std=std_remaining
         )
 
+        # Skip if option is too cheap (not worth quoting)
+        if fair_value < self.OPT_MIN_FAIR_VALUE:
+            return None
+
         # Base spread as percentage of fair value
         base_spread = max(self.OPT_MIN_SPREAD, self.OPT_BASE_SPREAD * fair_value)
 
@@ -250,20 +276,50 @@ class MyTradingStrategy(AbstractTradingStrategy):
         if fair_value > 0 and base_spread / fair_value > self.MAX_SPREAD_RATIO:
             return None
 
-        # Inventory adjustments
-        mid_skew = fair_value * self.INV_SKEW_FACTOR * position
-
+        # Inventory adjustments - asymmetric widening to encourage flattening
         inv_excess = max(0, abs(position) - self.INV_SOFT_LIMIT)
-        spread_widen = 1.0 + self.INV_WIDEN_FACTOR * inv_excess
-        spread = base_spread * spread_widen
 
-        # Calculate bid and ask
-        mid = fair_value - mid_skew
-        bid = max(self.MIN_BID, mid - spread / 2)
-        ask = mid + spread / 2
+        # Calculate base bid and ask
+        half_spread = base_spread / 2
+        base_bid = fair_value - half_spread
+        base_ask = fair_value + half_spread
 
-        # Validate
-        if bid >= ask:
+        # Skew mid price slightly based on position
+        mid_skew = fair_value * self.INV_SKEW_FACTOR * position
+        base_bid -= mid_skew
+        base_ask -= mid_skew
+
+        # Asymmetric widening: widen the side that prevents accumulating more inventory
+        if position > 0:  # Long position - need to sell
+            # Keep bid tight (don't want to buy more)
+            # Widen ask (more willing to sell at higher prices)
+            bid_widen = 1.0
+            ask_widen = 1.0 + self.INV_WIDEN_FACTOR * inv_excess
+        elif position < 0:  # Short position - need to buy
+            # Widen bid (more willing to buy at lower prices)
+            # Keep ask tight (don't want to sell more)
+            bid_widen = 1.0 + self.INV_WIDEN_FACTOR * inv_excess
+            ask_widen = 1.0
+        else:  # Flat - keep symmetric
+            bid_widen = 1.0
+            ask_widen = 1.0
+
+        # Apply widening
+        bid = base_bid - half_spread * (bid_widen - 1.0)
+        ask = base_ask + half_spread * (ask_widen - 1.0)
+
+        # Aggressive quoting: cross the spread to increase matching
+        if self.CROSS_SPREAD:
+            cross_amount = fair_value * self.CROSS_SPREAD_FACTOR
+            bid += cross_amount
+            ask -= cross_amount
+
+        # Ensure minimum bid
+        bid = max(self.MIN_BID, bid)
+        ask = max(self.MIN_BID, ask)
+
+        # Validate (allow very tight spreads for aggressive matching)
+        if bid >= ask + 0.01:  # Allow bid == ask (cross market)
             return None
 
         return (bid, ask)
